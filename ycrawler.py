@@ -26,18 +26,26 @@ class URLFetcher():
         self.fetch_counter = 0
 
     async def fetch(self, session, url):
-        """Fetch a URL using aiohttp returning parsed JSON response.
-        As suggested by the aiohttp docs we reuse the session.
+        """Fetch a URL using aiohttp returning content and status.
         """
         with async_timeout.timeout(FETCH_TIMEOUT):
             async with session.get(url) as response:
                 self.fetch_counter += 1
-                return await response.text()
+                return await response.text(), response.status
 
 
-def get_links(html, right='"', substr=None):
+def get_links(html, right='"', substr=None, split_pair=()):
     new_urls = []
-    for url in html.split('href="')[1:]:
+    if split_pair:
+        try:
+            html = html.split(split_pair[0], maxsplit=1)[1]
+            html = html.split(split_pair[1])[:-1]
+        except IndexError:
+            return new_urls
+    html = ''.join(html)
+    urls = html.split('href="')[1:]
+    for url in urls:
+        url = url.replace('&#x2F;', '/')
         if substr:
             if substr in url and right in url:
                 new_urls.append(url.split(right)[0])
@@ -79,7 +87,7 @@ def writing(path, body):
 async def download(loop, session, fetcher, link, path):
 
     try:
-        response = await fetcher.fetch(session, link)
+        response, status = await fetcher.fetch(session, link)
     except Exception as e:
         logging.debug("Error retrieving post {}: {}".format(link, e))
         raise e
@@ -95,10 +103,13 @@ async def get_comments_urls(loop, session, fetcher, link, save_dir, story=False)
     """Retrieve data for current post.
     """
     try:
-        response = await fetcher.fetch(session, link)
+        response, status = await fetcher.fetch(session, link)
     except Exception as e:
         logging.debug("Error retrieving post {}: {}".format(link, e))
         raise e
+
+    if status != 200:
+        return 0
 
     news_id = link.split(NEWS_QUERY_SUBSTR)[1]
     save_dir = os.path.abspath(os.path.join(save_dir, news_id))
@@ -108,17 +119,16 @@ async def get_comments_urls(loop, session, fetcher, link, save_dir, story=False)
         try:
             os.makedirs(save_dir)
         except (PermissionError, IOError) as e:
-            tb_lines = traceback.format_exception(*sys.exc_info())
-            logging.exception(''.join(tb_lines))
             raise e
 
         links = []
         if story:
             links = get_links(response, right='" class="storylink"')
+            print(link, links)
 
-        comments_links = get_links(response, substr='http')
+        comments_links = get_links(response, substr='http', split_pair=('comment-tree', '</table></td></tr>'))
         links.extend(comments_links)
-
+        print(comments_links)
         try:
             tasks = [asyncio.ensure_future(
                 download(loop, session, fetcher, link, save_dir)
@@ -149,15 +159,16 @@ async def get_news(loop, session, limit, iteration, save_dir):
     """
     fetcher = URLFetcher()  # create a new fetcher for this task
     try:
-        response = await fetcher.fetch(session, TOP_STORIES_URL)
+        response, status = await fetcher.fetch(session, TOP_STORIES_URL)
     except Exception as e:
         logging.error("Error retrieving top stories: {}".format(e))
         # return instead of re-raising as it will go unnoticed
         return
 
     # получение ссылок на страницы комментариев
+    links = get_links(response, substr=NEWS_QUERY_SUBSTR)
     links = get_full_links(
-        get_links(response, substr=NEWS_QUERY_SUBSTR),
+        links,
         TOP_STORIES_URL, limit=limit
     )
 
@@ -184,7 +195,9 @@ async def get_news(loop, session, limit, iteration, save_dir):
             print("Post {} has {} comments ({})".format(
                 tasks[done_task], done_task.result(), iteration))
         except Exception as e:
-            print("Error retrieving top stories: {}".format(e))
+            tb_lines = traceback.format_exception(*sys.exc_info())
+            logging.exception(''.join(tb_lines))
+            #print("Error retrieving top stories: {}".format(e))
 
     return fetcher.fetch_counter
 
@@ -235,7 +248,7 @@ if __name__ == '__main__':
     op.add_option("-L", "--log", action="store", default="")
     op.add_option("-l", "--limit", action="store", default=30, type="int")
     op.add_option("-p", "--period", action="store", default=10, type="int")
-    op.add_option("-d", "--downloads", action="store", default='D:\\otus_python\\hw11\\downloads\\')
+    op.add_option("-d", "--downloads", action="store", default='./downloads/')
     (opts, args) = op.parse_args()
     logging.basicConfig(filename=opts.log, level=logging.INFO,
                         format='[%(asctime)s] %(levelname).1s %(message)s', datefmt='%Y.%m.%d %H:%M:%S')
