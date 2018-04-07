@@ -7,14 +7,13 @@ from datetime import datetime
 from functools import partial
 from optparse import OptionParser
 from urllib.parse import urljoin, urldefrag
-from concurrent.futures import ThreadPoolExecutor
 
 import aiohttp
 import async_timeout
 
 
 TOP_STORIES_URL = "https://news.ycombinator.com/"
-FETCH_TIMEOUT = 10
+FETCH_TIMEOUT = 30
 NEWS_QUERY_SUBSTR = 'item?id='
 
 
@@ -29,9 +28,10 @@ class URLFetcher():
         """Fetch a URL using aiohttp returning content and status.
         """
         with async_timeout.timeout(FETCH_TIMEOUT):
-            async with session.get(url) as response:
-                self.fetch_counter += 1
-                return await response.text(), response.status
+            self.fetch_counter += 1
+            async with session.get(url, ssl=False) as response:
+                content = await response.read()
+                return content, response.status, response.charset
 
 
 def get_links(html, right='"', substr=None, split_pair=()):
@@ -43,14 +43,16 @@ def get_links(html, right='"', substr=None, split_pair=()):
         except IndexError:
             return new_urls
     html = ''.join(html)
-    urls = html.split('href="')[1:]
-    for url in urls:
-        url = url.replace('&#x2F;', '/')
+    parts = html.split('href="')[1:]
+    for part in parts:
+        part = part.replace('&#x2F;', '/')
         if substr:
-            if substr in url and right in url:
-                new_urls.append(url.split(right)[0])
-        elif right in url:
-            new_urls.append(url.split(right)[0])
+            if right in part:
+                part = part.split(right)[0]
+                if substr in part:
+                    new_urls.append(part)
+        elif right in part:
+            new_urls.append(part.split(right)[0])
 
     return new_urls
 
@@ -77,81 +79,76 @@ def remove_fragment(url):
 
 
 def writing(path, body):
-    try:
-        with open(path, 'w') as f:
-            f.write(body)
-    except (PermissionError, IOError):
-        raise
+    with open(path, 'wb') as f:
+        f.write(body)
 
 
 async def download(loop, session, fetcher, link, path):
 
     try:
-        response, status = await fetcher.fetch(session, link)
+        response, status, _ = await fetcher.fetch(session, link)
     except Exception as e:
         logging.debug("Error retrieving post {}: {}".format(link, e))
-        raise e
-
-    try:
-        await loop.run_in_executor(ThreadPoolExecutor, writing, path, response)
-    except Exception as e:
-        logging.debug("Error retrieving saving new sites: {}".format(e))
         raise
+
+    if status == 200:
+
+        path = os.path.join(path, link.replace('://', '_').replace('/', '_').replace('?', '_'))
+        try:
+            await loop.run_in_executor(None, writing, path, response)
+        except (PermissionError, IOError) as e:
+            logging.exception("Saving error: {}".format(e))
+            raise
 
 
 async def get_comments_urls(loop, session, fetcher, link, save_dir, story=False):
     """Retrieve data for current post.
     """
     try:
-        response, status = await fetcher.fetch(session, link)
+        response, status, charset = await fetcher.fetch(session, link)
     except Exception as e:
         logging.debug("Error retrieving post {}: {}".format(link, e))
         raise e
 
     if status != 200:
+        logging.info(
+            'Download url {} failed with status code {}.'.format(link, status)
+        )
         return 0
+
+    if charset:
+        response = response.decode(charset)
+    else:
+        response = response.decode()
 
     news_id = link.split(NEWS_QUERY_SUBSTR)[1]
     save_dir = os.path.abspath(os.path.join(save_dir, news_id))
-    comments_links = []
+    links = []
 
     if not os.path.exists(save_dir):
         try:
             os.makedirs(save_dir)
-        except (PermissionError, IOError) as e:
-            raise e
+        except (PermissionError, IOError):
+            return 0
 
-        links = []
         if story:
-            links = get_links(response, right='" class="storylink"')
-            print(link, links)
+            links = get_links(response, right='" class="storylink"', substr='http')
 
         comments_links = get_links(response, substr='http', split_pair=('comment-tree', '</table></td></tr>'))
         links.extend(comments_links)
-        print(comments_links)
+
+        tasks = [asyncio.ensure_future(
+            download(loop, session, fetcher, link, save_dir)
+        ) for link in links]
+
+        # schedule the tasks
         try:
-            tasks = [asyncio.ensure_future(
-                download(loop, session, fetcher, link, save_dir)
-            ) for link in links]
-
-            # schedule the tasks
-            try:
-                await asyncio.gather(*tasks)
-            except Exception as e:
-                logging.debug("Error retrieving comments for top stories: {}".format(e))
-                raise
-
-        except asyncio.CancelledError:
-            if tasks:
-                logging.info("Comments for post {} cancelled, cancelling {} child tasks".format(
-                    news_id, len(tasks)))
-                for task in tasks:
-                    task.cancel()
-            else:
-                logging.info("Comments for post {} cancelled".format(news_id))
+            await asyncio.gather(*tasks)
+        except Exception as e:
+            logging.debug("Error retrieving comments for top stories: {}".format(e))
             raise
 
-    return len(comments_links)
+    return len(links)
 
 
 async def get_news(loop, session, limit, iteration, save_dir):
@@ -159,11 +156,23 @@ async def get_news(loop, session, limit, iteration, save_dir):
     """
     fetcher = URLFetcher()  # create a new fetcher for this task
     try:
-        response, status = await fetcher.fetch(session, TOP_STORIES_URL)
+        response, status, charset = await fetcher.fetch(session, TOP_STORIES_URL)
     except Exception as e:
         logging.error("Error retrieving top stories: {}".format(e))
         # return instead of re-raising as it will go unnoticed
-        return
+        return 0
+
+    if status != 200:
+        logging.info(
+            'Download url {} failed with status code {}.'.format(
+                TOP_STORIES_URL, status)
+        )
+        return 0
+
+    if charset:
+        response = response.decode(charset)
+    else:
+        response = response.decode()
 
     # получение ссылок на страницы комментариев
     links = get_links(response, substr=NEWS_QUERY_SUBSTR)
@@ -179,25 +188,13 @@ async def get_news(loop, session, limit, iteration, save_dir):
             )): link for link in links
     }
 
-    # return on first exception to cancel any pending tasks
-    done, pending = await asyncio.shield(asyncio.wait(
-        tasks.keys(), return_when=asyncio.FIRST_EXCEPTION))
-
-    # if there are pending tasks is because there was an exception
-    # cancel any pending tasks
-    for pending_task in pending:
-        pending_task.cancel()
+    done, _ = await asyncio.shield(asyncio.wait(tasks.keys()))
 
     # process the done tasks
     for done_task in done:
         # if an exception is raised one of the Tasks will raise
-        try:
-            print("Post {} has {} comments ({})".format(
-                tasks[done_task], done_task.result(), iteration))
-        except Exception as e:
-            tb_lines = traceback.format_exception(*sys.exc_info())
-            logging.exception(''.join(tb_lines))
-            #print("Error retrieving top stories: {}".format(e))
+        logging.info("{} links have been downloaded from {}. ({})".format(
+            done_task.result(), tasks[done_task], iteration))
 
     return fetcher.fetch_counter
 
@@ -206,11 +203,7 @@ async def poll_top_news(loop, session, period, limit, save_dir):
     """Periodically poll for new stories and retrieve number of comments.
     """
     iteration = 1
-    errors = []
     while True:
-        if errors:
-            logging.info('Error detected, quitting')
-            return
 
         logging.info("Top {} news processing. ({})".format(
             limit, iteration))
@@ -221,17 +214,18 @@ async def poll_top_news(loop, session, period, limit, save_dir):
 
         now = datetime.now()
 
-        def callback(fut, errors):
+        def callback(fut):
             try:
                 fetch_count = fut.result()
             except Exception as e:
-                errors.append(e)
+                tb_lines = traceback.format_exception(*sys.exc_info())
+                logging.exception(''.join(tb_lines))
             else:
                 logging.info(
                     '> Download of news took {:.2f} seconds and {} fetches'.format(
                         (datetime.now() - now).total_seconds(), fetch_count))
 
-        future.add_done_callback(partial(callback, errors=errors))
+        future.add_done_callback(partial(callback))
 
         logging.info("Waiting for {} seconds...".format(period))
         iteration += 1
@@ -256,5 +250,8 @@ if __name__ == '__main__':
     logging.info("Crawler started.")
 
     loop = asyncio.get_event_loop()
-    loop.run_until_complete(run(loop, opts.period, opts.limit, opts.downloads))
+    try:
+        loop.run_until_complete(run(loop, opts.period, opts.limit, opts.downloads))
+    except KeyboardInterrupt:
+        pass
     loop.close()
