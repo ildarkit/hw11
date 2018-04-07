@@ -15,6 +15,8 @@ import async_timeout
 TOP_STORIES_URL = "https://news.ycombinator.com/"
 FETCH_TIMEOUT = 30
 NEWS_QUERY_SUBSTR = 'item?id='
+SPLIT_PAIR = ('comment-tree', '</table></td></tr>')
+RIGHT_SPLITTER = '" class="storylink"'
 
 
 class URLFetcher():
@@ -132,9 +134,9 @@ async def get_comments_urls(loop, session, fetcher, link, save_dir, story=False)
             return 0
 
         if story:
-            links = get_links(response, right='" class="storylink"', substr='http')
+            links = get_links(response, right=RIGHT_SPLITTER, substr='http')
 
-        comments_links = get_links(response, substr='http', split_pair=('comment-tree', '</table></td></tr>'))
+        comments_links = get_links(response, substr='http', split_pair=SPLIT_PAIR)
         links.extend(comments_links)
 
         tasks = [asyncio.ensure_future(
