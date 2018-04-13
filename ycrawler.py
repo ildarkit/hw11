@@ -85,7 +85,7 @@ def writing(path, body):
         f.write(body)
 
 
-async def download(loop, session, fetcher, link, path):
+async def download(session, fetcher, link, path):
 
     try:
         response, status, _ = await fetcher.fetch(session, link)
@@ -96,6 +96,7 @@ async def download(loop, session, fetcher, link, path):
     if status == 200:
 
         path = os.path.join(path, link.replace('://', '_').replace('/', '_').replace('?', '_'))
+        loop = asyncio.get_event_loop()
         try:
             await loop.run_in_executor(None, writing, path, response)
         except (PermissionError, IOError) as e:
@@ -103,7 +104,7 @@ async def download(loop, session, fetcher, link, path):
             raise
 
 
-async def get_comments_urls(loop, session, fetcher, link, save_dir, story=False):
+async def get_comments_urls(session, fetcher, link, save_dir, story=False):
     """Retrieve data for current post.
     """
     try:
@@ -140,7 +141,7 @@ async def get_comments_urls(loop, session, fetcher, link, save_dir, story=False)
         links.extend(comments_links)
 
         tasks = [asyncio.ensure_future(
-            download(loop, session, fetcher, link, save_dir)
+            download(session, fetcher, link, save_dir)
         ) for link in links]
 
         # schedule the tasks
@@ -153,7 +154,7 @@ async def get_comments_urls(loop, session, fetcher, link, save_dir, story=False)
     return len(links)
 
 
-async def get_news(loop, session, limit, iteration, save_dir):
+async def get_news(session, limit, iteration, save_dir):
     """Retrieve top stories in HN.
     """
     fetcher = URLFetcher()  # create a new fetcher for this task
@@ -186,11 +187,11 @@ async def get_news(loop, session, limit, iteration, save_dir):
     tasks = {
         asyncio.ensure_future(
             get_comments_urls(
-                loop, session, fetcher, link, save_dir, story=True
+                session, fetcher, link, save_dir, story=True
             )): link for link in links
     }
 
-    done, _ = await asyncio.shield(asyncio.wait(tasks.keys()))
+    done, _ = await asyncio.wait(tasks.keys())
 
     # process the done tasks
     for done_task in done:
@@ -201,7 +202,7 @@ async def get_news(loop, session, limit, iteration, save_dir):
     return fetcher.fetch_counter
 
 
-async def poll_top_news(loop, session, period, limit, save_dir):
+async def poll_top_news(session, period, limit, save_dir):
     """Periodically poll for new stories and retrieve number of comments.
     """
     iteration = 1
@@ -211,7 +212,7 @@ async def poll_top_news(loop, session, period, limit, save_dir):
             limit, iteration))
 
         future = asyncio.ensure_future(
-            get_news(loop, session, limit, iteration, save_dir)
+            get_news(session, limit, iteration, save_dir)
         )
 
         now = datetime.now()
@@ -220,8 +221,7 @@ async def poll_top_news(loop, session, period, limit, save_dir):
             try:
                 fetch_count = fut.result()
             except Exception as e:
-                tb_lines = traceback.format_exception(*sys.exc_info())
-                logging.exception(''.join(tb_lines))
+                logging.exception('Unexpected error occurred: {}'.format(e))
             else:
                 logging.info(
                     '> Download of news took {:.2f} seconds and {} fetches'.format(
@@ -236,7 +236,7 @@ async def poll_top_news(loop, session, period, limit, save_dir):
 
 async def run(loop, period, limit, save_dir):
     async with aiohttp.ClientSession(loop=loop) as session:
-        await poll_top_news(loop, session, period, limit, save_dir)
+        await poll_top_news(session, period, limit, save_dir)
 
 
 if __name__ == '__main__':
